@@ -239,8 +239,33 @@ def http_chunked():
         pr.kill()
 
 
+def audit_regressions():
+    """2026-11 QA audit: odd field types, collapsed churn fills, new-run after a filled bet."""
+    m = load(); ok = True
+    for mut in ({"account": {"cashUsd": "10", "eligibleVolumeUsd": "0", "completedCycles": "x", "position": None}},
+                {"market": {"id": "m1", "secondsToClose": None}}, {"account": {"cashUsd": True}},
+                {"account": {"cashUsd": 10, "position": [1, 2]}}, {"rules": {"maximumBuyCashUsd": "NaN"}},
+                {"reference": "junk"}, {"books": {"YES": [], "NO": "x"}}):
+        o = obs(); o.update(mut)
+        try:
+            out = m.decide(o)
+            ok &= out.get("action") in ("HOLD", "BUY", "SELL")
+        except Exception:
+            ok = False
+    check("odd field types never raise", ok)
+    # a churn BUY that fills far below the quote (favourite collapsed) is sold, not held as a bet
+    m = load(); b = m.BOT; b._fresh = False; b.refueled, b.c0, b.v0, b.t_start = True, 40, 0, 1.79e9
+    out = m.decide(obs(cash=40, vol=10, cyc=1))
+    pos = {"market_id": "m1", "outcome": "YES", "shares": 9, "buy_gross_usd": 4.5, "buy_fees_usd": 0.1, "sell_gross_usd": 0, "sell_fees_usd": 0}
+    check("collapsed churn fill (avg 0.50) is sold", out.get("action") == "BUY" and m.decide(obs(cash=35, vol=10, cyc=1, pos=pos)) == {"action": "SELL"})
+    # bet filled then lost back to exactly $10 in a new run: must reset
+    m = load(); b = m.BOT; b._fresh = False; b.bet_seen, b.bet_market, b.t_start, b.last = True, "old", 1.79e9, [0, 0, 1.79e9]
+    m.decide(obs(cash=10, vol=0, cyc=0, ts=1.79e9 + 60))
+    check("new $10 run after a filled bet resets bet state", b.bet_seen is False and b.bet_market in (None, "m1"))
+
+
 if __name__ == "__main__":
-    for t in (fuzz, stale_state_file, reused_process, rerefuel_oscillation, restart_with_open_bet, thin_book, full_cycle, http_and_latency, opus_review_regressions, http_chunked):
+    for t in (fuzz, stale_state_file, reused_process, rerefuel_oscillation, restart_with_open_bet, thin_book, full_cycle, http_and_latency, opus_review_regressions, http_chunked, audit_regressions):
         t()
     print(f"\n{len(FAILS)} failed" if FAILS else "\nALL PASS")
     sys.exit(1 if FAILS else 0)

@@ -23,7 +23,7 @@ from typing import Any
 CFG = {
     "fuel_goal": 35.0,        # refuel until cash >= this (sweeps: 30-35 best; 35 most robust to worse fills)
     "bet_band": 0.06,         # buy the underdog when its ask is within [q_max - band, q_max]
-    "bet_min_ask": 0.05,
+    "bet_min_ask": 0.09,      # asks below this won 10-25% less often than priced at every timing measured
     "bet_secs_lo": 100.0,     # place bets with this much time left ...
     "bet_secs_hi": 280.0,     # ... and no earlier than this
     "bet_sell_bid": 0.98,     # sell a winning bet at/after this bid near close (eligible volume)
@@ -48,21 +48,25 @@ CFG = {
     "taker": 0.07,
     "overlay": 0.01,
     "target_volume": 1000.0,
-    # experimental (neutral defaults)
+    # experimental (neutral defaults; each was swept and found neutral or worse - see README)
     "lock_cash": 1e9,         # sell a refuel bet early once cash + its sale value >= this (locks in the refuel)
     "lock_secs_min": 15.0,    # ... only with at least this much time left (late wins use bet_sell_bid)
-    "step_mult": 1e9,
-    "dust_q": 0.10,
+    "step_mult": 1e9,         # ladder: each bet aims for min(goal, cash * step_mult) instead of the goal in one shot
+    "dust_q": 0.10,           # if the goal needs an ask below this, climb in steps instead of idling on leftover cash
     "bet_avg_max": 0.9,       # a held position bought below this average price is a refuel bet (churn buys >= 0.95)
-    "bet_max_spread": 1.0,
-    "bet_q_max": 1.0,         # cap the bet price: bet cheaper underdogs with a smaller need-sized stake (1.0 = off)
-    "bet_pick": "high",       # "high": priciest ask in the band; "low": cheapest (smaller need-sized stake, keeps a 2nd shot)    # skip underdog books wider than this (experimental; 1.0 = off)
-    "adapt_spread": False,    # spread limits relative to recently observed tightest spreads (wide-book regimes)
+    "bet_max_spread": 1.0,    # skip underdog books wider than this (1.0 = off)
+    "bet_q_max": 1.0,         # cap the bet price (1.0 = off)
+    "bet_pick": "high",       # "high": priciest ask in the band; "low": cheapest
+    # settlement model filter for refuel bets (settlement ~ mean of the last 60 s of the reference)
+    "twap_edge_min": None,    # e.g. 0.15: only bet a side whose model P(win) - ask >= this (None = off)
+    "twap_secs_lo": 20.0,     # with the model on, bets are allowed this late (entries close at 15 s)
+    "twap_sigma_secs": 300,   # volatility lookback (1 s returns)
+    "twap_ref_max_age": 3.0,  # ignore reference prices older than this
+    "adapt_spread": False,    # spread limits relative to recently observed tightest spreads
     "adapt_add": [0.001, 0.003, 0.02],  # on-pace / behind / late: allowed spread above the recent tightest one
-    "adapt_markets": 48,      # recent tightest = min of the per-market minimum over this many markets (~4 h):
-                              # only ~6% of markets ever show a <=0.002 book (median gap 1 h, p90 3 h, max 7 h)
+    "adapt_markets": 48,      # recent tightest = min of the per-market minimum over this many markets (~4 h)
     "adapt_min_markets": 24,  # observe this many markets before adapting
-    "adapt_stat": "min",      # "min" keeps patience for rare tight books ($4 at the crossing); "median" = typical            # >0: if the goal needs an ask below this, climb in steps (bet to what a full stake reaches here)         # ladder: each bet aims for min(goal, cash * step_mult) instead of the goal in one shot
+    "adapt_stat": "min",      # "min" keeps patience for rare tight books; "median" = typical
 }
 CFG.update(json.loads(os.environ.get("BOLD_CFG", "{}")))
 
@@ -81,6 +85,21 @@ def _levels(rows: Any, *, reverse: bool) -> list[tuple[float, float]]:
 
 def _fee_rate(p: float) -> float:
     return CFG["taker"] * (1 - p) + CFG["overlay"]  # fee per $ of notional
+
+
+def _f(x: Any, default: Any = None) -> Any:
+    """float(x) if x is a finite number (bool excluded), else `default`. Never raises."""
+    try:
+        if isinstance(x, bool):
+            return default
+        v = float(x)
+        return v if math.isfinite(v) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _d(x: Any) -> dict:
+    return x if isinstance(x, dict) else {}
 
 
 def _now(obs: dict) -> float:
@@ -138,23 +157,27 @@ class BoldBot:
         self._fresh = True
         self.t_start: float | None = None  # first observation ~ window start
         self.buy_mid: str | None = None      # market where we last emitted a BUY (position ids may use another format)
+        self.buy_kind: str | None = None     # "bet" or "churn": what that BUY was for
+        self._kind: str | None = None
+        self.K: float | None = None
         self.bet_cash0: float | None = None  # cash just before the current refuel bet
         self.bet_seen = False                # the current refuel bet actually filled (we held it)
         self.last: list | None = None  # [volume, cycles, timestamp] of the previous call: detects a new run
         self._errors = 0
         self._saved_at = 0.0
+        self.px: dict[int, float] = {}       # second -> BTC reference mid (not persisted; ~6 min window)
         self.mkt_min: dict[str, float] = {}  # market id -> tightest eligible churn spread seen (not persisted)
         self.lock = threading.Lock()
 
-    _KEYS = ("bet_market", "refueled", "goal", "c0", "v0", "t_start", "buy_mid", "bet_cash0", "bet_seen", "last")  # "last" must stay last
+    _KEYS = ("bet_market", "refueled", "goal", "c0", "v0", "t_start", "buy_mid", "buy_kind", "bet_cash0", "bet_seen", "last")  # "last" must stay last
     _NUM = (int, float)
     _TYPES = {"bet_market": (str, type(None)), "refueled": (bool,), "goal": _NUM, "c0": _NUM + (type(None),),
-              "v0": _NUM + (type(None),), "t_start": _NUM + (type(None),), "buy_mid": (str, type(None)),
+              "v0": _NUM + (type(None),), "t_start": _NUM + (type(None),), "buy_mid": (str, type(None)), "buy_kind": (str, type(None)),
               "bet_cash0": _NUM + (type(None),), "bet_seen": (bool,), "last": (list, type(None))}
 
     def _reset(self) -> None:
         self.bet_market, self.refueled, self.goal = None, False, CFG["fuel_goal"]
-        self.c0 = self.v0 = self.t_start = self.last = self.buy_mid = self.bet_cash0 = None
+        self.c0 = self.v0 = self.t_start = self.last = self.buy_mid = self.buy_kind = self.bet_cash0 = None
         self.bet_seen = False
         self._fresh = True
 
@@ -203,21 +226,23 @@ class BoldBot:
     def _decide_locked(self, obs: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(obs, dict):
             return {"action": "HOLD"}
-        acct = obs.get("account") or {}
-        vol = float(acct.get("eligibleVolumeUsd", 0) or 0)
-        cyc = int(acct.get("completedCycles", 0) or 0)
+        acct = _d(obs.get("account"))
+        vol = _f(acct.get("eligibleVolumeUsd"), 0.0)
+        cyc = int(_f(acct.get("completedCycles"), 0.0))
+        cash0 = _f(acct.get("cashUsd"))
         now = _now(obs)
         if self.last is not None:  # a new run (stale state file, or one process reused for several runs)?
             lv, lc, lt = self.last
-            fresh_acct = vol == 0 and cyc == 0 and acct.get("position") is None and abs(float(acct.get("cashUsd", 0) or 0) - 10.0) < 1e-6
-            if vol < lv - 1e-6 or cyc < lc or (now and lt and abs(now - lt) > 3 * 3600) or (fresh_acct and self.refueled):
+            # a brand-new account ($10, flat, nothing traded) cannot follow a filled bet or a refuel in the same run
+            fresh_acct = vol == 0 and cyc == 0 and acct.get("position") is None and cash0 is not None and abs(cash0 - 10.0) < 1e-6
+            if vol < lv - 1e-6 or cyc < lc or (now and lt and abs(now - lt) > 3 * 3600) or (fresh_acct and (self.refueled or self.bet_seen)):
                 self._reset()
         before = tuple(getattr(self, k) for k in self._KEYS[:-1])
-        if self._fresh:
+        if self._fresh and not (vol > 0 and cash0 is None):  # (unreadable cash: infer on a later call)
             self._fresh = False
             if vol > 0:  # restarted mid-run without saved state: refuel is done
                 self.refueled = True
-                self.c0, self.v0 = float(acct["cashUsd"]), vol
+                self.c0, self.v0 = cash0, vol
                 if now > 0:  # unknown start time: assume we are just behind schedule (safer than "on pace")
                     frac = min(1.0, vol / CFG["target_volume"] + CFG["late_margin"])
                     self.t_start = now - frac * CFG["deadline_hours"] * 3600
@@ -225,11 +250,11 @@ class BoldBot:
         out = self._decide(obs)
         if out.get("action") == "BUY":  # last line of defence: never emit an invalid BUY
             x = out.get("maxCashUsd")
-            cash = float(acct.get("cashUsd", 0) or 0)
+            cash = cash0 or 0.0
             if not (isinstance(x, float) and math.isfinite(x) and 0 < x <= min(5.0, cash) and out.get("outcome") in ("YES", "NO")):
                 out = {"action": "HOLD"}
         if out.get("action") == "BUY":
-            self.buy_mid = str((obs.get("market") or {}).get("id"))
+            self.buy_mid, self.buy_kind = str(_d(obs.get("market")).get("id")), self._kind
         if tuple(getattr(self, k) for k in self._KEYS[:-1]) != before or time.monotonic() - self._saved_at > 10:
             self._save()
         return out
@@ -237,47 +262,53 @@ class BoldBot:
     def _decide(self, obs: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(obs, dict):
             return {"action": "HOLD"}
-        mkt, acct, rules = obs.get("market") or {}, obs.get("account") or {}, obs.get("rules") or {}
-        raw = obs.get("books") or {}
-        books = {sd: raw.get(sd) if isinstance(raw.get(sd), dict) else {} for sd in ("YES", "NO")}
+        mkt, acct, rules, raw = _d(obs.get("market")), _d(obs.get("account")), _d(obs.get("rules")), _d(obs.get("books"))
+        books = {sd: _d(raw.get(sd)) for sd in ("YES", "NO")}
         now = _now(obs)
         if self.t_start is None and now > 0:
             self.t_start = now
         self.elapsed_h = (now - self.t_start) / 3600 if self.t_start else 0.0
-        secs = float(mkt["secondsToClose"])
-        mid = str(mkt["id"])
-        cash = float(acct["cashUsd"])
-        vol = float(acct.get("eligibleVolumeUsd", 0.0) or 0.0)
-        if not all(math.isfinite(x) for x in (secs, cash, vol, now)):
-            return {"action": "HOLD"}
+        self._now_ts = now
+        if CFG["twap_edge_min"] is not None:
+            self._record_ref(obs, now)
+        secs, cash = _f(mkt.get("secondsToClose")), _f(acct.get("cashUsd"))
+        mid = str(mkt.get("id"))
+        vol = _f(acct.get("eligibleVolumeUsd"), 0.0)
+        cap = min(_f(rules.get("maximumBuyCashUsd"), 5.0), 5.0)
+        if cap <= 0:
+            cap = 0.0  # can still SELL/HOLD, never BUY
+        target = _f(rules.get("targetVolumeUsd"), CFG["target_volume"])
+        if target <= 0:
+            target = CFG["target_volume"]
         pos = acct.get("position")
-        cap = min(float(rules.get("maximumBuyCashUsd", 5.0)), 5.0)
-        target = float(rules.get("targetVolumeUsd", CFG["target_volume"]) or CFG["target_volume"])
-        if not (math.isfinite(cap) and cap > 0):
-            cap = 0.0  # unreadable cap: can still SELL/HOLD, never BUY
 
         if pos is not None:
+            if not isinstance(pos, dict):
+                return {"action": "HOLD"}
             side = str(pos.get("outcome"))
             bids = _levels(books.get(side, {}).get("bids", []), reverse=True)
             if str(pos.get("market_id", mid)) != mid and self.buy_mid != mid:
                 return {"action": "HOLD"}  # bought in an earlier market: settles on its own
-            try:
-                shares, paid = float(pos.get("shares") or 0), float(pos.get("buy_gross_usd") or 0)
-            except (TypeError, ValueError):
-                shares = paid = 0.0
+            shares, paid = _f(pos.get("shares"), 0.0), _f(pos.get("buy_gross_usd"), 0.0)
             avg = paid / shares if shares > 0 and paid > 0 else None
             is_bet = avg < CFG["bet_avg_max"] if avg is not None else mid == self.bet_market
+            if is_bet and self.buy_mid == mid and self.buy_kind == "churn":
+                is_bet = False             # a churn buy filled far below its quote (favourite collapsing): get out
             if is_bet:                     # refuel bet: hold to settlement, sell a clear winner late
                 self.bet_seen, self.bet_market = True, mid
+                if secs is None:
+                    return {"action": "HOLD"}
                 if bids and bids[0][0] >= CFG["bet_sell_bid"] and secs <= CFG["bet_sell_secs"]:
                     return {"action": "SELL"}
-                if bids and secs >= CFG["lock_secs_min"] and CFG["lock_cash"] < 1e8:
-                    back = _sell_value(bids, float(pos.get("shares", 0)))
+                if bids and cash is not None and secs >= CFG["lock_secs_min"] and CFG["lock_cash"] < 1e8:
+                    back = _sell_value(bids, shares)
                     if back is not None and cash + back >= CFG["lock_cash"]:
                         return {"action": "SELL"}
                 return {"action": "HOLD"}
             return {"action": "SELL"} if bids else {"action": "HOLD"}  # churn: straight back out
 
+        if secs is None or cash is None:
+            return {"action": "HOLD"}
         if vol >= target - 1e-9 or cap <= 0:
             return {"action": "HOLD"}
         bet_done = (self.bet_seen and cash > (self.bet_cash0 or 0) + 1e-9  # a bet that filled and won
@@ -298,8 +329,53 @@ class BoldBot:
             return self._bet(books, secs, mid, cash, cap)
         return self._churn(books, secs, cash, cap, vol, target)
 
+    def _record_ref(self, obs, now):
+        ref = _d(obs.get("reference"))
+        try:
+            px, at = float(ref.get("btcMidUsd")), float(ref.get("observedAt"))
+            self.K = float(ref.get("openingTargetUsd")) if not ref.get("targetProvisional") else None
+        except (TypeError, ValueError):
+            self.K = None
+            return
+        if math.isfinite(px) and math.isfinite(at) and now - at <= CFG["twap_ref_max_age"]:
+            self.px[int(at)] = px
+            if len(self.px) > 420:
+                cut = int(at) - 400
+                for k in [k for k in self.px if k < cut]:
+                    del self.px[k]
+
+    def _p_up(self, now, secs):
+        """P(settlement mean of the last 60 s >= K) from the reference history; None if not enough data."""
+        K = getattr(self, "K", None)
+        if K is None or not self.px:
+            return None
+        t_now = max(self.px)
+        if now - t_now > CFG["twap_ref_max_age"]:
+            return None
+        ser = [self.px[k] for k in range(t_now - CFG["twap_sigma_secs"], t_now + 1) if k in self.px]
+        if len(ser) < 120:
+            return None
+        d = [b - a for a, b in zip(ser, ser[1:])]
+        m = sum(d) / len(d)
+        sig = max(math.sqrt(sum((x - m) ** 2 for x in d) / len(d)), 1e-6)
+        p0, tau = self.px[t_now], max(secs, 1.0)
+        if tau < 60:
+            t_close = t_now + tau
+            known = [self.px[k] for k in range(int(t_close - 60), t_now + 1) if k in self.px]
+            if len(known) < 0.7 * (60 - tau):
+                return None
+            k_sum = sum(known) * (60 - tau) / len(known)
+            mean = (k_sum + tau * p0) / 60
+            sd = tau / 60 * sig * math.sqrt((tau + 1) * (2 * tau + 1) / (6 * tau))
+        else:
+            mean = p0
+            sd = sig * math.sqrt((tau - 60) + 61 * 121 / 360)
+        return 0.5 * (1 + math.erf((mean - K) / (sd * math.sqrt(2))))
+
     def _bet(self, books, secs, mid, cash, cap):
-        if not (CFG["bet_secs_lo"] <= secs <= CFG["bet_secs_hi"]) or cash < CFG["min_bet_cash"]:
+        model = CFG["twap_edge_min"] is not None
+        lo = CFG["twap_secs_lo"] if model else CFG["bet_secs_lo"]
+        if not (lo <= secs <= CFG["bet_secs_hi"]) or cash < CFG["min_bet_cash"]:
             return {"action": "HOLD"}
         if self.bet_market == mid:
             return {"action": "HOLD"}  # one bet per market
@@ -312,10 +388,15 @@ class BoldBot:
             goal = cash - stake + stake / (dq * (1 + _fee_rate(dq)))
             q_hi = self._q_max(cash, stake, goal)
         q_lo = max(CFG["bet_min_ask"], q_hi - CFG["bet_band"])
+        pu = self._p_up(self._now_ts, secs) if model else None
+        if model and pu is None:
+            return {"action": "HOLD"}
         best = None
         for side in ("YES", "NO"):
             asks = _levels(books.get(side, {}).get("asks", []), reverse=False)
             bids = _levels(books.get(side, {}).get("bids", []), reverse=True)
+            if model and asks and (pu if side == "YES" else 1 - pu) - asks[0][0] < CFG["twap_edge_min"]:
+                continue
             if asks and CFG["bet_max_spread"] < 1 and (not bids or asks[0][0] - bids[0][0] > CFG["bet_max_spread"] + 1e-9):
                 continue
             better = best is None or (asks and (asks[0][0] < best[1] if CFG["bet_pick"] == "low" else asks[0][0] > best[1]))
@@ -327,7 +408,7 @@ class BoldBot:
         k = 1 / (q * (1 + _fee_rate(q)))      # shares per $ staked
         need = (goal - cash) / (k - 1)  # smallest stake whose win reaches the target
         use = min(stake, max(need * 1.03, 1.01 * _min_size(books.get(side, {})) / k))
-        self.bet_market, self.bet_cash0, self.bet_seen = mid, cash, False
+        self.bet_market, self.bet_cash0, self.bet_seen, self._kind = mid, cash, False, "bet"
         return {"action": "BUY", "outcome": side, "maxCashUsd": _floor6(use)}
 
     def _q_max(self, cash, stake, goal):
@@ -345,7 +426,7 @@ class BoldBot:
         dv = vol - (self.v0 or 0.0)
         rate = CFG["cost_prior"]
         if dv >= CFG["cost_min_vol"]:
-            rate = max((self.c0 - cash) / dv, 0.0)
+            rate = max(((self.c0 if self.c0 is not None else cash) - cash) / dv, 0.0)
         return (target - vol) * rate * CFG["cost_margin"] + CFG["reserve"]
 
     def _observe_spread(self, books, mid):
@@ -400,6 +481,7 @@ class BoldBot:
                 best = (side, cost)
         if best is None:
             return {"action": "HOLD"}
+        self._kind = "churn"
         return {"action": "BUY", "outcome": best[0], "maxCashUsd": spend}
 
 
@@ -438,8 +520,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802
         try:
-            body = json.loads(self._body() or b"{}")
-            out = BOT.decide(body)  # BOT.decide serialises calls with a lock
+            raw = self._body()
+        except Exception:  # noqa: BLE001
+            raw, self.close_connection = b"", True
+        try:
+            out = BOT.decide(json.loads(raw or b"{}"))  # BOT.decide serialises calls with a lock
         except Exception:  # noqa: BLE001
             out = {"action": "HOLD"}
         self._reply(out)
